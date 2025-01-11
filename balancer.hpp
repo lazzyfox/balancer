@@ -59,6 +59,7 @@ namespace {
   template <typename T> concept FS = std::same_as<std::remove_cvref_t<T>, std::filesystem::path>;
   template <typename T> concept STR = std::same_as<std::remove_cvref_t<T>, std::string>;
   template <typename T> concept UI16 = std::same_as<std::remove_cvref_t<T>, uint16_t>;
+  template <typename T> concept INT = std::same_as<std::remove_cvref_t<T>, int>;
   constexpr std::string LOOPBACK_INT {"127.0.0.1"};
   constexpr uint16_t MAX_DATA {1024};
 }
@@ -112,6 +113,7 @@ namespace NetSide {
 
   };
 
+
   class BaseTCP {
     public:
       std::optional<std::string> err{};
@@ -134,6 +136,7 @@ namespace NetSide {
       int sock_fd{0};
       int new_sock{0};
       uint16_t port{0};
+     // THRQueue<int> sock_store;
       mutable std::atomic_bool new_message{false};
 
       void *get_in_addr(struct sockaddr *sa)
@@ -155,7 +158,7 @@ namespace NetSide {
         }
         return ret;
       }
-      template<STR T> [[nodiscrd]] std::expected<int64_t, std::string> new_snd_msg(T&& msg) const noexcept {
+      template<STR T> [[nodiscrd]] std::expected<int64_t, std::string> new_snd_msg(T&& msg) noexcept {
         std::expected<int64_t, std::string> ret;
 
         auto res = send(new_sock, msg.c_str(), msg.size(), 0);
@@ -177,21 +180,14 @@ namespace NetSide {
         }
 
         sin_size = sizeof their_addr;
-        if (!new_sock) {
-          new_sock = accept(sock_fd, (struct sockaddr *)&their_addr, &sin_size);
-          if (new_sock == SOCKET_ERROR) {
-            err.emplace("Connection accept failed");
-            return {};
-          }
+        new_sock = accept(sock_fd, (struct sockaddr *)&their_addr, &sin_size);
+        if (new_sock == SOCKET_ERROR) {
+          err.emplace("Connection accept failed");
+          return {};
         }
-
-
         auto res = recv(new_sock, msg, MSG_SIZE-1, 0);
         if (res == SOCKET_ERROR) {
           return ret;
-        }
-        if (new_message.is_lock_free()) {
-          new_message.store(false);
         }
         return ret;
       }
@@ -505,7 +501,7 @@ namespace MgrSide {
   class ReadConfJSON final : LibVirtIt {
     public:
       ReadConfJSON() : LibVirtIt() {};
-      template<FS Fs, STR Str> ReadConfJSON(Fs&& path, Str vm_path) : LibVirtIt{vm_path} {
+      template<FS Fs, STR Str> ReadConfJSON(Fs&& path, Str&& vm_path) : LibVirtIt{std::forward<Str>(vm_path)} {
         init(std::forward<Fs>(path));
       }
       template<FS Fs> ReadConfJSON(Fs&& path) : LibVirtIt{} {
@@ -541,7 +537,7 @@ namespace MgrSide {
             std::string dataip {it->at("dataip")};
             std::string mac {it->at("mac")};
             VMData data{vmname, oamip, dataip, mac};
-            if (auto macAddr{getMAC(mac)}; macAddr.has_value()) {
+            if (auto macAddr{getMAC(vmname)}; macAddr.has_value()) {
               data.mac = macAddr.value();
             }
             stor->emplace(std::make_pair(vmname, data));
@@ -628,12 +624,8 @@ namespace MgrSide {
         cln_work_run = false;
       }
       void mgrMonitor(void) noexcept {
-        client_store->redy_to_get.wait(false);
-        auto it_queue{order_set};
-        while (!order_set.empty()) {
-          auto st = order_set.front();
-          order_set.pop();
-        }
+        start_monitor.wait(false);
+        start_monitor=false;
       }
     private :
       const uint16_t push_port;
@@ -646,6 +638,7 @@ namespace MgrSide {
       std::shared_ptr<NetSide::ReqStore> client_store, vm_store;
       std::atomic_bool cln_req{false}, vm_req{false};
       std::atomic_bool cln_work_run{true}, vm_work_run{true};
+      std::atomic_bool start_connect{false}, start_monitor{false};
 
       std::thread thr_VM_process, thr_Client_process;
 
@@ -677,8 +670,6 @@ namespace MgrSide {
             }
           }
           vm_push();
-          vm_store->redy_to_get = true;
-          vm_store->redy_to_get.notify_all();
       }
     }
       // Sending update event notification to all VMs
@@ -713,8 +704,11 @@ namespace MgrSide {
 
           auto balance_str{balance_stor->getStore()};
           if (balance_str.has_value()) {
-            auto snd_data = vm_int->new_snd_msg(balance_str.value());
+            std::string str =  balance_str.value();
+            auto snd_data = vm_int->new_snd_msg(str);
           }
+          start_monitor = true;
+          start_monitor.notify_all();
         }
       }
   };
@@ -728,7 +722,7 @@ namespace ExtService {
       std::optional<std::string> err;
       template<STR Str, UI16 Ui16, FS Fs>
       VMServ (Str&& addr, Ui16&& vm_port, Ui16&& push_port, Fs&& path) :
-        addr{std::forward<Str>(addr)}, vm_port {std::forward<Ui16>(vm_port)}, push_port{std::forward<Ui16>(push_port)} {
+        addr{std::forward<Str>(addr)}, vm_port {std::forward<Ui16>(vm_port)}, push_port{std::forward<Ui16>(push_port)}, path {std::forward<Fs>(path)} {
         fs_stream.open(path.string().c_str(), std::ios::trunc);
         if (!fs_stream.is_open()) {
           err.emplace("Balancing data file open error");
@@ -746,6 +740,7 @@ namespace ExtService {
           auto snd_msg = std::make_unique<NetSide::ClnTCP>(LOOPBACK_INT, push_port);
           snd_msg->snd_msg(str);
         }
+        fs_stream.close();
       }
       VMServ(VMServ&) = delete;
       VMServ(VMServ&&) = delete;
@@ -753,13 +748,14 @@ namespace ExtService {
       VMServ& operator = (VMServ&&) = delete;
 
       std::string monitor(void) {
+        monitor_worker = false;
         monitor_worker.wait(false);
         return std::string {"Upd recieved"};
-        monitor_worker=false;
       }
     private :
       const std::string addr;
       const uint16_t vm_port, push_port;
+      const std::filesystem::path path;
       std::ofstream fs_stream;
 
       std::thread thr;
@@ -778,7 +774,12 @@ namespace ExtService {
           auto new_balance_data = snd_msg->snd_rcv_msg(std::string{"port"});
 
           if (new_balance_data.has_value()) {
-            fs_stream << new_balance_data.value();
+            std::string str{new_balance_data.value()};
+            if (fs_stream.is_open()) {
+              fs_stream.close();
+            }
+            fs_stream.open(path.string().c_str(), std::ios::trunc);
+            fs_stream << new_balance_data.value()<<std::flush;
             monitor_worker = true;
             monitor_worker.notify_all();
           }
